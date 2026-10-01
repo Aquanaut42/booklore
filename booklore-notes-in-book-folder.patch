@@ -1,0 +1,1025 @@
+diff --git a/booklore-api/src/main/java/org/booklore/controller/BookNoteController.java b/booklore-api/src/main/java/org/booklore/controller/BookNoteController.java
+index c7e14b7..1801abb 100644
+--- a/booklore-api/src/main/java/org/booklore/controller/BookNoteController.java
++++ b/booklore-api/src/main/java/org/booklore/controller/BookNoteController.java
+@@ -38,12 +38,13 @@ public class BookNoteController {
+         return bookNoteService.createOrUpdateNote(request);
+     }
+ 
+-    @Operation(summary = "Delete a note", description = "Delete a specific note by its ID.")
++    @Operation(summary = "Delete a note", description = "Delete a specific note of a book by its ID.")
+     @ApiResponse(responseCode = "204", description = "Note deleted successfully")
+-    @DeleteMapping("/{noteId}")
++    @DeleteMapping("/book/{bookId}/{noteId}")
+     public ResponseEntity<Void> deleteNote(
+-            @Parameter(description = "ID of the note to delete") @PathVariable Long noteId) {
+-        bookNoteService.deleteNote(noteId);
++            @Parameter(description = "ID of the book") @PathVariable Long bookId,
++            @Parameter(description = "ID of the note to delete") @PathVariable String noteId) {
++        bookNoteService.deleteNote(bookId, noteId);
+         return ResponseEntity.noContent().build();
+     }
+ }
+diff --git a/booklore-api/src/main/java/org/booklore/model/dto/BookNote.java b/booklore-api/src/main/java/org/booklore/model/dto/BookNote.java
+index 0f33673..996687b 100644
+--- a/booklore-api/src/main/java/org/booklore/model/dto/BookNote.java
++++ b/booklore-api/src/main/java/org/booklore/model/dto/BookNote.java
+@@ -12,7 +12,7 @@ import java.time.LocalDateTime;
+ @NoArgsConstructor
+ @AllArgsConstructor
+ public class BookNote {
+-    private Long id;
++    private String id;
+     private Long userId;
+     private Long bookId;
+     private String title;
+diff --git a/booklore-api/src/main/java/org/booklore/model/dto/CreateBookNoteRequest.java b/booklore-api/src/main/java/org/booklore/model/dto/CreateBookNoteRequest.java
+index 3a3009d..50855ef 100644
+--- a/booklore-api/src/main/java/org/booklore/model/dto/CreateBookNoteRequest.java
++++ b/booklore-api/src/main/java/org/booklore/model/dto/CreateBookNoteRequest.java
+@@ -12,7 +12,7 @@ import lombok.NoArgsConstructor;
+ @NoArgsConstructor
+ @AllArgsConstructor
+ public class CreateBookNoteRequest {
+-    private Long id;
++    private String id;
+ 
+     @NotNull(message = "Book ID is required")
+     private Long bookId;
+diff --git a/booklore-api/src/main/java/org/booklore/model/dto/notes/BookNoteFile.java b/booklore-api/src/main/java/org/booklore/model/dto/notes/BookNoteFile.java
+new file mode 100644
+index 0000000..e393af1
+--- /dev/null
++++ b/booklore-api/src/main/java/org/booklore/model/dto/notes/BookNoteFile.java
+@@ -0,0 +1,48 @@
++package org.booklore.model.dto.notes;
++
++import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
++import com.fasterxml.jackson.annotation.JsonInclude;
++import lombok.AllArgsConstructor;
++import lombok.Builder;
++import lombok.Data;
++import lombok.NoArgsConstructor;
++
++import java.time.Instant;
++import java.util.ArrayList;
++import java.util.List;
++
++/**
++ * On-disk representation of the notes for one book, stored next to the book file
++ * as {@code <book name>.notes.json}. The file holds the notes of every user; each
++ * entry records its owner by username so the file stays meaningful if the database
++ * is ever rebuilt.
++ */
++@Data
++@Builder
++@NoArgsConstructor
++@AllArgsConstructor
++@JsonInclude(JsonInclude.Include.NON_NULL)
++@JsonIgnoreProperties(ignoreUnknown = true)
++public class BookNoteFile {
++
++    @Builder.Default
++    private int version = 1;
++
++    @Builder.Default
++    private List<Entry> notes = new ArrayList<>();
++
++    @Data
++    @Builder
++    @NoArgsConstructor
++    @AllArgsConstructor
++    @JsonInclude(JsonInclude.Include.NON_NULL)
++    @JsonIgnoreProperties(ignoreUnknown = true)
++    public static class Entry {
++        private String id;
++        private String owner;
++        private String title;
++        private String content;
++        private Instant createdAt;
++        private Instant updatedAt;
++    }
++}
+diff --git a/booklore-api/src/main/java/org/booklore/model/entity/BookNoteEntity.java b/booklore-api/src/main/java/org/booklore/model/entity/BookNoteEntity.java
+index c757b72..29f309d 100644
+--- a/booklore-api/src/main/java/org/booklore/model/entity/BookNoteEntity.java
++++ b/booklore-api/src/main/java/org/booklore/model/entity/BookNoteEntity.java
+@@ -40,6 +40,13 @@ public class BookNoteEntity {
+     @Column(name = "content", nullable = false, columnDefinition = "TEXT")
+     private String content;
+ 
++    /**
++     * Notes now live in a file next to the book. This table is only kept as a source for the one-time
++     * import; rows are flagged once they have been written to their file.
++     */
++    @Column(name = "migrated_to_file", nullable = false)
++    private boolean migratedToFile;
++
+     @CreationTimestamp
+     @Column(name = "created_at", nullable = false, updatable = false)
+     private LocalDateTime createdAt;
+diff --git a/booklore-api/src/main/java/org/booklore/repository/BookNoteRepository.java b/booklore-api/src/main/java/org/booklore/repository/BookNoteRepository.java
+index 10e20eb..14bfa4a 100644
+--- a/booklore-api/src/main/java/org/booklore/repository/BookNoteRepository.java
++++ b/booklore-api/src/main/java/org/booklore/repository/BookNoteRepository.java
+@@ -2,16 +2,14 @@ package org.booklore.repository;
+ 
+ import org.booklore.model.entity.BookNoteEntity;
+ import org.springframework.data.jpa.repository.JpaRepository;
+-import org.springframework.data.jpa.repository.Query;
+-import org.springframework.data.repository.query.Param;
+ 
+ import java.util.List;
+-import java.util.Optional;
+ 
++/**
++ * Only used for the one-time import of notes that were stored in the database before
++ * notes moved to files next to the books. See {@code LegacyBookNoteMigration}.
++ */
+ public interface BookNoteRepository extends JpaRepository<BookNoteEntity, Long> {
+ 
+-    Optional<BookNoteEntity> findByIdAndUserId(Long id, Long userId);
+-
+-    @Query("SELECT n FROM BookNoteEntity n WHERE n.bookId = :bookId AND n.userId = :userId ORDER BY n.updatedAt DESC")
+-    List<BookNoteEntity> findByBookIdAndUserIdOrderByUpdatedAtDesc(@Param("bookId") Long bookId, @Param("userId") Long userId);
++    List<BookNoteEntity> findByMigratedToFileFalse();
+ }
+diff --git a/booklore-api/src/main/java/org/booklore/service/book/BookNoteFileStore.java b/booklore-api/src/main/java/org/booklore/service/book/BookNoteFileStore.java
+new file mode 100644
+index 0000000..1dcd3e5
+--- /dev/null
++++ b/booklore-api/src/main/java/org/booklore/service/book/BookNoteFileStore.java
+@@ -0,0 +1,118 @@
++package org.booklore.service.book;
++
++import lombok.extern.slf4j.Slf4j;
++import org.booklore.model.dto.notes.BookNoteFile;
++import org.springframework.stereotype.Component;
++import tools.jackson.databind.ObjectMapper;
++import tools.jackson.databind.SerializationFeature;
++import tools.jackson.databind.json.JsonMapper;
++
++import java.io.IOException;
++import java.nio.file.AtomicMoveNotSupportedException;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.StandardCopyOption;
++import java.util.concurrent.ConcurrentHashMap;
++
++/**
++ * Reads and writes the per-book notes file that lives next to the book file.
++ * <p>
++ * Callers that do a read-modify-write cycle must hold {@link #lockFor(Path)} for the
++ * whole cycle so concurrent requests cannot overwrite each other.
++ */
++@Slf4j
++@Component
++public class BookNoteFileStore {
++
++    public static final String NOTES_SUFFIX = ".notes.json";
++
++    private static final ConcurrentHashMap<Path, Object> LOCKS = new ConcurrentHashMap<>();
++
++    private final ObjectMapper objectMapper = JsonMapper.builder()
++            .findAndAddModules()
++            .configure(SerializationFeature.INDENT_OUTPUT, true)
++            .build();
++
++    public static Path getNotesPath(Path bookPath) {
++        String fileName = bookPath.getFileName().toString();
++        int dotIndex = fileName.lastIndexOf('.');
++        String baseName = (dotIndex > 0) ? fileName.substring(0, dotIndex) : fileName;
++        return bookPath.resolveSibling(baseName + NOTES_SUFFIX);
++    }
++
++    public Object lockFor(Path bookPath) {
++        return LOCKS.computeIfAbsent(getNotesPath(bookPath).toAbsolutePath().normalize(), p -> new Object());
++    }
++
++    /**
++     * Returns the notes stored for the book, or an empty file if none exists yet.
++     * Throws if the file exists but cannot be parsed, so a damaged file is never silently overwritten.
++     */
++    public BookNoteFile read(Path bookPath) throws IOException {
++        Path notesPath = getNotesPath(bookPath);
++        if (!Files.exists(notesPath)) {
++            return new BookNoteFile();
++        }
++        try {
++            BookNoteFile file = objectMapper.readValue(Files.readString(notesPath), BookNoteFile.class);
++            if (file == null) {
++                return new BookNoteFile();
++            }
++            if (file.getNotes() == null) {
++                file.setNotes(new java.util.ArrayList<>());
++            }
++            return file;
++        } catch (IOException e) {
++            throw e;
++        } catch (Exception e) {
++            throw new IOException("Notes file is not valid JSON: " + notesPath + " (" + e.getMessage() + ")", e);
++        }
++    }
++
++    /**
++     * Writes the notes atomically (temp file + rename). When there are no notes left the file is removed
++     * so empty files are not left behind in the library.
++     */
++    public void write(Path bookPath, BookNoteFile file) throws IOException {
++        Path notesPath = getNotesPath(bookPath);
++
++        if (file.getNotes() == null || file.getNotes().isEmpty()) {
++            Files.deleteIfExists(notesPath);
++            return;
++        }
++
++        Path tempPath = notesPath.resolveSibling(notesPath.getFileName() + ".tmp");
++        try {
++            Files.writeString(tempPath, objectMapper.writeValueAsString(file));
++            try {
++                Files.move(tempPath, notesPath, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
++            } catch (AtomicMoveNotSupportedException e) {
++                Files.move(tempPath, notesPath, StandardCopyOption.REPLACE_EXISTING);
++            }
++        } finally {
++            Files.deleteIfExists(tempPath);
++        }
++    }
++
++    /**
++     * Keeps the notes file next to the book when the book file is moved or renamed.
++     * Static so it can be called from file-move code without adding dependencies there.
++     */
++    public static void moveNotesFile(Path oldBookPath, Path newBookPath) {
++        if (oldBookPath == null || newBookPath == null) {
++            return;
++        }
++        try {
++            Path oldNotes = getNotesPath(oldBookPath);
++            Path newNotes = getNotesPath(newBookPath);
++            if (oldNotes.equals(newNotes) || !Files.exists(oldNotes)) {
++                return;
++            }
++            Files.createDirectories(newNotes.getParent());
++            Files.move(oldNotes, newNotes, StandardCopyOption.REPLACE_EXISTING);
++            log.info("Moved notes file from {} to {}", oldNotes, newNotes);
++        } catch (IOException e) {
++            log.warn("Failed to move notes file from {} to {}: {}", oldBookPath, newBookPath, e.getMessage());
++        }
++    }
++}
+diff --git a/booklore-api/src/main/java/org/booklore/service/book/BookNoteService.java b/booklore-api/src/main/java/org/booklore/service/book/BookNoteService.java
+index 15af020..8506602 100644
+--- a/booklore-api/src/main/java/org/booklore/service/book/BookNoteService.java
++++ b/booklore-api/src/main/java/org/booklore/service/book/BookNoteService.java
+@@ -1,78 +1,153 @@
+ package org.booklore.service.book;
+ 
++import jakarta.persistence.EntityNotFoundException;
++import lombok.RequiredArgsConstructor;
++import lombok.extern.slf4j.Slf4j;
+ import org.booklore.config.security.service.AuthenticationService;
+ import org.booklore.exception.ApiError;
+-import org.booklore.mapper.BookNoteMapper;
+ import org.booklore.model.dto.BookLoreUser;
+ import org.booklore.model.dto.BookNote;
+ import org.booklore.model.dto.CreateBookNoteRequest;
++import org.booklore.model.dto.notes.BookNoteFile;
+ import org.booklore.model.entity.BookEntity;
+-import org.booklore.model.entity.BookLoreUserEntity;
+-import org.booklore.model.entity.BookNoteEntity;
+-import org.booklore.repository.BookNoteRepository;
+ import org.booklore.repository.BookRepository;
+-import org.booklore.repository.UserRepository;
+-import jakarta.persistence.EntityNotFoundException;
+-import lombok.AllArgsConstructor;
+ import org.springframework.stereotype.Service;
+ import org.springframework.transaction.annotation.Transactional;
+ 
++import java.io.IOException;
++import java.nio.file.Path;
++import java.time.Instant;
++import java.time.LocalDateTime;
++import java.time.ZoneId;
++import java.util.Comparator;
+ import java.util.List;
+-import java.util.stream.Collectors;
++import java.util.UUID;
+ 
++/**
++ * Book notes are stored in a {@code <book name>.notes.json} file in the same folder as the book,
++ * not in the database. Each user only ever sees and changes their own notes.
++ */
++@Slf4j
+ @Service
+-@AllArgsConstructor
++@RequiredArgsConstructor
+ public class BookNoteService {
+ 
+-    private final BookNoteRepository bookNoteRepository;
+     private final BookRepository bookRepository;
+-    private final UserRepository userRepository;
+-    private final BookNoteMapper mapper;
++    private final BookNoteFileStore fileStore;
+     private final AuthenticationService authenticationService;
+ 
+     @Transactional(readOnly = true)
+     public List<BookNote> getNotesForBook(Long bookId) {
+-        BookLoreUser currentUser = authenticationService.getAuthenticatedUser();
+-        return bookNoteRepository.findByBookIdAndUserIdOrderByUpdatedAtDesc(bookId, currentUser.getId())
+-                .stream()
+-                .map(mapper::toDto)
+-                .collect(Collectors.toList());
++        BookLoreUser user = authenticationService.getAuthenticatedUser();
++        Path bookPath = resolveBookPath(bookId);
++
++        BookNoteFile file;
++        synchronized (fileStore.lockFor(bookPath)) {
++            file = readFile(bookPath);
++        }
++
++        return file.getNotes().stream()
++                .filter(entry -> isOwnedBy(entry, user))
++                .sorted(Comparator.comparing(BookNoteFile.Entry::getUpdatedAt, Comparator.nullsLast(Comparator.reverseOrder())))
++                .map(entry -> toDto(entry, bookId, user))
++                .toList();
+     }
+ 
+-    @Transactional
++    @Transactional(readOnly = true)
+     public BookNote createOrUpdateNote(CreateBookNoteRequest request) {
+-        BookLoreUser currentUser = authenticationService.getAuthenticatedUser();
+-
+-        BookEntity book = bookRepository.findById(request.getBookId())
+-                .orElseThrow(() -> ApiError.BOOK_NOT_FOUND.createException(request.getBookId()));
+-
+-        BookLoreUserEntity user = userRepository.findById(currentUser.getId())
+-                .orElseThrow(() -> new EntityNotFoundException("User not found: " + currentUser.getId()));
+-
+-        BookNoteEntity noteEntity;
+-
+-        if (request.getId() != null) {
+-            noteEntity = bookNoteRepository.findByIdAndUserId(request.getId(), currentUser.getId())
+-                    .orElseThrow(() -> new EntityNotFoundException("Note not found: " + request.getId()));
+-            noteEntity.setTitle(request.getTitle());
+-            noteEntity.setContent(request.getContent());
+-        } else {
+-            noteEntity = BookNoteEntity.builder()
+-                    .user(user)
+-                    .book(book)
+-                    .title(request.getTitle())
+-                    .content(request.getContent())
+-                    .build();
++        BookLoreUser user = authenticationService.getAuthenticatedUser();
++        Path bookPath = resolveBookPath(request.getBookId());
++        Instant now = Instant.now();
++
++        synchronized (fileStore.lockFor(bookPath)) {
++            BookNoteFile file = readFile(bookPath);
++            BookNoteFile.Entry entry;
++
++            if (request.getId() != null) {
++                entry = file.getNotes().stream()
++                        .filter(n -> request.getId().equals(n.getId()) && isOwnedBy(n, user))
++                        .findFirst()
++                        .orElseThrow(() -> new EntityNotFoundException("Note not found: " + request.getId()));
++                entry.setTitle(request.getTitle());
++                entry.setContent(request.getContent());
++                entry.setUpdatedAt(now);
++            } else {
++                entry = BookNoteFile.Entry.builder()
++                        .id(UUID.randomUUID().toString())
++                        .owner(user.getUsername())
++                        .title(request.getTitle())
++                        .content(request.getContent())
++                        .createdAt(now)
++                        .updatedAt(now)
++                        .build();
++                file.getNotes().add(entry);
++            }
++
++            writeFile(bookPath, file);
++            return toDto(entry, request.getBookId(), user);
++        }
++    }
++
++    @Transactional(readOnly = true)
++    public void deleteNote(Long bookId, String noteId) {
++        BookLoreUser user = authenticationService.getAuthenticatedUser();
++        Path bookPath = resolveBookPath(bookId);
++
++        synchronized (fileStore.lockFor(bookPath)) {
++            BookNoteFile file = readFile(bookPath);
++            boolean removed = file.getNotes().removeIf(n -> noteId.equals(n.getId()) && isOwnedBy(n, user));
++            if (!removed) {
++                throw new EntityNotFoundException("Note not found: " + noteId);
++            }
++            writeFile(bookPath, file);
++        }
++    }
++
++    private Path resolveBookPath(Long bookId) {
++        BookEntity book = bookRepository.findByIdWithBookFiles(bookId)
++                .orElseThrow(() -> ApiError.BOOK_NOT_FOUND.createException(bookId));
++        Path bookPath = book.getFullFilePath();
++        if (bookPath == null) {
++            throw ApiError.FILE_NOT_FOUND.createException("Book " + bookId + " has no file path, so its notes folder is unknown");
++        }
++        return bookPath;
++    }
++
++    private BookNoteFile readFile(Path bookPath) {
++        try {
++            return fileStore.read(bookPath);
++        } catch (IOException e) {
++            log.error("Failed to read notes file for {}: {}", bookPath, e.getMessage());
++            throw ApiError.INTERNAL_SERVER_ERROR.createException("Could not read the notes file next to this book: " + e.getMessage());
+         }
++    }
++
++    private void writeFile(Path bookPath, BookNoteFile file) {
++        try {
++            fileStore.write(bookPath, file);
++        } catch (IOException e) {
++            log.error("Failed to write notes file for {}: {}", bookPath, e.getMessage());
++            throw ApiError.INTERNAL_SERVER_ERROR.createException("Could not save the notes file next to this book (is the folder writable?): " + e.getMessage());
++        }
++    }
++
++    private boolean isOwnedBy(BookNoteFile.Entry entry, BookLoreUser user) {
++        return entry.getOwner() != null && entry.getOwner().equals(user.getUsername());
++    }
+ 
+-        BookNoteEntity savedNote = bookNoteRepository.save(noteEntity);
+-        return mapper.toDto(savedNote);
++    private BookNote toDto(BookNoteFile.Entry entry, Long bookId, BookLoreUser user) {
++        return BookNote.builder()
++                .id(entry.getId())
++                .userId(user.getId())
++                .bookId(bookId)
++                .title(entry.getTitle())
++                .content(entry.getContent())
++                .createdAt(toLocal(entry.getCreatedAt()))
++                .updatedAt(toLocal(entry.getUpdatedAt()))
++                .build();
+     }
+ 
+-    @Transactional
+-    public void deleteNote(Long noteId) {
+-        BookLoreUser currentUser = authenticationService.getAuthenticatedUser();
+-        BookNoteEntity note = bookNoteRepository.findByIdAndUserId(noteId, currentUser.getId()).orElseThrow(() -> new EntityNotFoundException("Note not found: " + noteId));
+-        bookNoteRepository.delete(note);
++    private LocalDateTime toLocal(Instant instant) {
++        return instant == null ? null : LocalDateTime.ofInstant(instant, ZoneId.systemDefault());
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/booklore-api/src/main/java/org/booklore/service/book/LegacyBookNoteMigration.java b/booklore-api/src/main/java/org/booklore/service/book/LegacyBookNoteMigration.java
+new file mode 100644
+index 0000000..aa6eb73
+--- /dev/null
++++ b/booklore-api/src/main/java/org/booklore/service/book/LegacyBookNoteMigration.java
+@@ -0,0 +1,113 @@
++package org.booklore.service.book;
++
++import lombok.RequiredArgsConstructor;
++import lombok.extern.slf4j.Slf4j;
++import org.booklore.model.dto.notes.BookNoteFile;
++import org.booklore.model.entity.BookEntity;
++import org.booklore.model.entity.BookNoteEntity;
++import org.booklore.repository.BookNoteRepository;
++import org.booklore.repository.BookRepository;
++import org.springframework.boot.context.event.ApplicationReadyEvent;
++import org.springframework.context.event.EventListener;
++import org.springframework.stereotype.Component;
++import org.springframework.transaction.annotation.Transactional;
++
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Path;
++import java.time.LocalDateTime;
++import java.time.ZoneId;
++import java.time.Instant;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.UUID;
++import java.util.stream.Collectors;
++
++/**
++ * One-time import of notes that used to be stored in the {@code book_notes} table.
++ * <p>
++ * Each row is written into the notes file next to its book and then flagged as migrated, so the
++ * import is safe to repeat: rows whose book folder is not reachable (for example an unmounted drive)
++ * are simply retried on the next start, and notes deleted afterwards are never brought back.
++ * The database rows are never deleted, so they remain as a backup.
++ */
++@Slf4j
++@Component
++@RequiredArgsConstructor
++public class LegacyBookNoteMigration {
++
++    private final BookNoteRepository bookNoteRepository;
++    private final BookRepository bookRepository;
++    private final BookNoteFileStore fileStore;
++
++    @EventListener(ApplicationReadyEvent.class)
++    @Transactional
++    public void migrate() {
++        List<BookNoteEntity> pending = bookNoteRepository.findByMigratedToFileFalse();
++        if (pending.isEmpty()) {
++            return;
++        }
++
++        log.info("Moving {} book note(s) from the database into files next to their books", pending.size());
++
++        Map<Long, List<BookNoteEntity>> byBook = pending.stream()
++                .collect(Collectors.groupingBy(BookNoteEntity::getBookId));
++
++        int migrated = 0;
++        int skipped = 0;
++        for (Map.Entry<Long, List<BookNoteEntity>> group : byBook.entrySet()) {
++            try {
++                migrated += migrateBook(group.getKey(), group.getValue());
++            } catch (Exception e) {
++                skipped += group.getValue().size();
++                log.warn("Could not move notes of book {} to a file, will retry on next start: {}", group.getKey(), e.getMessage());
++            }
++        }
++
++        log.info("Book note migration finished: {} moved, {} left for a later start", migrated, skipped);
++    }
++
++    private int migrateBook(Long bookId, List<BookNoteEntity> notes) throws Exception {
++        BookEntity book = bookRepository.findByIdWithBookFiles(bookId).orElse(null);
++        Path bookPath = book == null ? null : book.getFullFilePath();
++        if (bookPath == null) {
++            throw new IllegalStateException("book has no file path");
++        }
++
++        synchronized (fileStore.lockFor(bookPath)) {
++            BookNoteFile file = fileStore.read(bookPath);
++            Set<String> existingIds = new HashSet<>();
++            file.getNotes().forEach(n -> existingIds.add(n.getId()));
++
++            for (BookNoteEntity note : notes) {
++                String id = legacyId(note.getId());
++                if (existingIds.add(id)) {
++                    file.getNotes().add(BookNoteFile.Entry.builder()
++                            .id(id)
++                            .owner(note.getUser().getUsername())
++                            .title(note.getTitle())
++                            .content(note.getContent())
++                            .createdAt(toInstant(note.getCreatedAt()))
++                            .updatedAt(toInstant(note.getUpdatedAt()))
++                            .build());
++                }
++            }
++
++            fileStore.write(bookPath, file);
++        }
++
++        notes.forEach(n -> n.setMigratedToFile(true));
++        bookNoteRepository.saveAll(notes);
++        return notes.size();
++    }
++
++    /** Stable id derived from the old row id, so a repeated import never duplicates a note. */
++    static String legacyId(Long databaseId) {
++        return UUID.nameUUIDFromBytes(("booklore-legacy-book-note-" + databaseId).getBytes(StandardCharsets.UTF_8)).toString();
++    }
++
++    private Instant toInstant(LocalDateTime time) {
++        return time == null ? null : time.atZone(ZoneId.systemDefault()).toInstant();
++    }
++}
+diff --git a/booklore-api/src/main/java/org/booklore/service/file/FileMoveService.java b/booklore-api/src/main/java/org/booklore/service/file/FileMoveService.java
+index 5b936ef..f06726e 100644
+--- a/booklore-api/src/main/java/org/booklore/service/file/FileMoveService.java
++++ b/booklore-api/src/main/java/org/booklore/service/file/FileMoveService.java
+@@ -17,6 +17,7 @@ import org.booklore.repository.BookAdditionalFileRepository;
+ import org.booklore.repository.BookRepository;
+ import org.booklore.repository.LibraryRepository;
+ import org.booklore.service.NotificationService;
++import org.booklore.service.book.BookNoteFileStore;
+ import org.booklore.service.metadata.sidecar.SidecarMetadataWriter;
+ import org.booklore.service.monitoring.MonitoringRegistrationService;
+ import org.springframework.stereotype.Service;
+@@ -228,6 +229,8 @@ public class FileMoveService {
+                 log.warn("Failed to move sidecar files for book ID {}: {}", bookId, e.getMessage());
+             }
+ 
++            BookNoteFileStore.moveNotesFile(currentPrimaryFilePath, newFilePath);
++
+             entityManager.clear();
+ 
+             BookEntity fresh = bookRepository.findById(bookId).orElseThrow();
+@@ -387,6 +390,8 @@ public class FileMoveService {
+                 log.warn("Failed to move sidecar files for book ID {}: {}", bookEntity.getId(), e.getMessage());
+             }
+ 
++            BookNoteFileStore.moveNotesFile(currentPrimaryFilePath, expectedPrimaryFilePath);
++
+             if (isLibraryMonitoredWhenCalled) {
+                 // Ensure any file system events from the move and cleanup are drained/ignored while we are still unregistered
+                 sleep(EVENT_DRAIN_TIMEOUT_MS);
+diff --git a/booklore-api/src/main/resources/db/migration/V134__Add_migrated_to_file_to_book_notes.sql b/booklore-api/src/main/resources/db/migration/V134__Add_migrated_to_file_to_book_notes.sql
+new file mode 100644
+index 0000000..80e90aa
+--- /dev/null
++++ b/booklore-api/src/main/resources/db/migration/V134__Add_migrated_to_file_to_book_notes.sql
+@@ -0,0 +1,2 @@
++ALTER TABLE book_notes
++    ADD COLUMN migrated_to_file BOOLEAN NOT NULL DEFAULT FALSE;
+diff --git a/booklore-api/src/test/java/org/booklore/service/BookNoteFileStoreTest.java b/booklore-api/src/test/java/org/booklore/service/BookNoteFileStoreTest.java
+new file mode 100644
+index 0000000..bd11515
+--- /dev/null
++++ b/booklore-api/src/test/java/org/booklore/service/BookNoteFileStoreTest.java
+@@ -0,0 +1,71 @@
++package org.booklore.service;
++
++import org.booklore.model.dto.notes.BookNoteFile;
++import org.booklore.service.book.BookNoteFileStore;
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.api.io.TempDir;
++
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.time.Instant;
++
++import static org.junit.jupiter.api.Assertions.*;
++
++class BookNoteFileStoreTest {
++
++    @TempDir
++    Path dir;
++
++    private final BookNoteFileStore store = new BookNoteFileStore();
++
++    @Test
++    void notesPath_replacesBookExtension() {
++        assertEquals(dir.resolve("Dune.notes.json"), BookNoteFileStore.getNotesPath(dir.resolve("Dune.epub")));
++        assertEquals(dir.resolve("NoExtension.notes.json"), BookNoteFileStore.getNotesPath(dir.resolve("NoExtension")));
++    }
++
++    @Test
++    void writeThenRead_roundTrips() throws Exception {
++        Path book = dir.resolve("Dune.epub");
++        Instant now = Instant.parse("2026-01-02T03:04:05Z");
++        BookNoteFile file = new BookNoteFile();
++        file.getNotes().add(BookNoteFile.Entry.builder()
++                .id("abc").owner("alice").title("T").content("C").createdAt(now).updatedAt(now).build());
++
++        store.write(book, file);
++        BookNoteFile read = store.read(book);
++
++        assertEquals(1, read.getNotes().size());
++        BookNoteFile.Entry entry = read.getNotes().get(0);
++        assertEquals("abc", entry.getId());
++        assertEquals("alice", entry.getOwner());
++        assertEquals("C", entry.getContent());
++        assertEquals(now, entry.getCreatedAt());
++    }
++
++    @Test
++    void write_leavesNoTempFileBehind() throws Exception {
++        Path book = dir.resolve("Dune.epub");
++        BookNoteFile file = new BookNoteFile();
++        file.getNotes().add(BookNoteFile.Entry.builder().id("a").owner("u").content("c").build());
++
++        store.write(book, file);
++
++        try (var files = Files.list(dir)) {
++            assertEquals(1, files.count());
++        }
++    }
++
++    @Test
++    void moveNotesFile_followsBookRename() throws Exception {
++        Path oldBook = dir.resolve("Old.epub");
++        Path newDir = Files.createDirectory(dir.resolve("sub"));
++        Path newBook = newDir.resolve("New.epub");
++        Files.writeString(BookNoteFileStore.getNotesPath(oldBook), "{}");
++
++        BookNoteFileStore.moveNotesFile(oldBook, newBook);
++
++        assertFalse(Files.exists(dir.resolve("Old.notes.json")));
++        assertTrue(Files.exists(newDir.resolve("New.notes.json")));
++    }
++}
+diff --git a/booklore-api/src/test/java/org/booklore/service/BookNoteServiceTest.java b/booklore-api/src/test/java/org/booklore/service/BookNoteServiceTest.java
+index 78a4402..fef602d 100644
+--- a/booklore-api/src/test/java/org/booklore/service/BookNoteServiceTest.java
++++ b/booklore-api/src/test/java/org/booklore/service/BookNoteServiceTest.java
+@@ -1,23 +1,20 @@
+ package org.booklore.service;
+ 
++import jakarta.persistence.EntityNotFoundException;
+ import org.booklore.config.security.service.AuthenticationService;
+-import org.booklore.mapper.BookNoteMapper;
+ import org.booklore.model.dto.BookLoreUser;
+ import org.booklore.model.dto.BookNote;
+ import org.booklore.model.dto.CreateBookNoteRequest;
+ import org.booklore.model.entity.BookEntity;
+-import org.booklore.model.entity.BookLoreUserEntity;
+-import org.booklore.model.entity.BookNoteEntity;
+-import org.booklore.repository.BookNoteRepository;
+ import org.booklore.repository.BookRepository;
+-import org.booklore.repository.UserRepository;
++import org.booklore.service.book.BookNoteFileStore;
+ import org.booklore.service.book.BookNoteService;
+-import jakarta.persistence.EntityNotFoundException;
+ import org.junit.jupiter.api.BeforeEach;
+ import org.junit.jupiter.api.Test;
+-import org.mockito.ArgumentCaptor;
++import org.junit.jupiter.api.io.TempDir;
+ 
+-import java.util.Collections;
++import java.nio.file.Files;
++import java.nio.file.Path;
+ import java.util.List;
+ import java.util.Optional;
+ 
+@@ -26,161 +23,113 @@ import static org.mockito.Mockito.*;
+ 
+ class BookNoteServiceTest {
+ 
+-    private BookNoteRepository bookNoteRepository;
+-    private BookRepository bookRepository;
+-    private UserRepository userRepository;
+-    private BookNoteMapper mapper;
++    @TempDir
++    Path libraryDir;
++
++    private AuthenticationService authenticationService;
+     private BookNoteService service;
++    private Path bookPath;
+ 
+-    private final Long userId = 1L;
+     private final Long bookId = 2L;
+-    private final Long noteId = 3L;
+ 
+     @BeforeEach
+-    void setUp() {
+-        bookNoteRepository = mock(BookNoteRepository.class);
+-        bookRepository = mock(BookRepository.class);
+-        userRepository = mock(UserRepository.class);
+-        mapper = mock(BookNoteMapper.class);
+-        AuthenticationService authenticationService = mock(AuthenticationService.class);
+-        service = new BookNoteService(bookNoteRepository, bookRepository, userRepository, mapper, authenticationService);
++    void setUp() throws Exception {
++        BookRepository bookRepository = mock(BookRepository.class);
++        authenticationService = mock(AuthenticationService.class);
++        service = new BookNoteService(bookRepository, new BookNoteFileStore(), authenticationService);
++
++        bookPath = libraryDir.resolve("My Book.epub");
++        Files.createFile(bookPath);
+ 
++        BookEntity book = mock(BookEntity.class);
++        when(book.getFullFilePath()).thenReturn(bookPath);
++        when(bookRepository.findByIdWithBookFiles(bookId)).thenReturn(Optional.of(book));
++
++        loginAs(1L, "alice");
++    }
++
++    private void loginAs(Long id, String username) {
+         BookLoreUser user = new BookLoreUser();
+-        user.setId(userId);
++        user.setId(id);
++        user.setUsername(username);
+         when(authenticationService.getAuthenticatedUser()).thenReturn(user);
+     }
+ 
+-    @Test
+-    void getNotesForBook_returnsMappedNotes() {
+-        BookNoteEntity entity = BookNoteEntity.builder().id(noteId).build();
+-        BookNote dto = BookNote.builder().id(noteId).build();
+-        when(bookNoteRepository.findByBookIdAndUserIdOrderByUpdatedAtDesc(bookId, userId))
+-                .thenReturn(Collections.singletonList(entity));
+-        when(mapper.toDto(entity)).thenReturn(dto);
+-
+-        List<BookNote> result = service.getNotesForBook(bookId);
+-
+-        assertEquals(1, result.size());
+-        assertEquals(noteId, result.getFirst().getId());
++    private CreateBookNoteRequest request(String id, String title, String content) {
++        return CreateBookNoteRequest.builder().id(id).bookId(bookId).title(title).content(content).build();
+     }
+ 
+     @Test
+-    void createOrUpdateNote_createsNewNote_whenIdIsNull() {
+-        CreateBookNoteRequest req = CreateBookNoteRequest.builder()
+-                .bookId(bookId)
+-                .title("t")
+-                .content("c")
+-                .build();
+-
+-        BookEntity book = BookEntity.builder().id(bookId).build();
+-        BookLoreUserEntity userEntity = BookLoreUserEntity.builder().id(userId).isDefaultPassword(false).build();
+-        BookNoteEntity savedEntity = BookNoteEntity.builder().id(noteId).build();
+-        BookNote dto = BookNote.builder().id(noteId).build();
+-
+-        when(bookRepository.findById(bookId)).thenReturn(Optional.of(book));
+-        when(userRepository.findById(userId)).thenReturn(Optional.of(userEntity));
+-        when(bookNoteRepository.save(any(BookNoteEntity.class))).thenReturn(savedEntity);
+-        when(mapper.toDto(savedEntity)).thenReturn(dto);
+-
+-        BookNote result = service.createOrUpdateNote(req);
+-
+-        assertEquals(noteId, result.getId());
+-        ArgumentCaptor<BookNoteEntity> captor = ArgumentCaptor.forClass(BookNoteEntity.class);
+-        verify(bookNoteRepository).save(captor.capture());
+-        BookNoteEntity entity = captor.getValue();
+-        assertEquals(book, entity.getBook());
+-        assertEquals(userEntity, entity.getUser());
+-        assertEquals("t", entity.getTitle());
+-        assertEquals("c", entity.getContent());
++    void getNotesForBook_returnsEmptyListWhenNoFileExists() {
++        assertTrue(service.getNotesForBook(bookId).isEmpty());
++        assertFalse(Files.exists(libraryDir.resolve("My Book.notes.json")));
+     }
+ 
+     @Test
+-    void createOrUpdateNote_updatesExistingNote_whenIdIsPresent() {
+-        CreateBookNoteRequest req = CreateBookNoteRequest.builder()
+-                .id(noteId)
+-                .bookId(bookId)
+-                .title("new title")
+-                .content("new content")
+-                .build();
+-
+-        BookNoteEntity existing = BookNoteEntity.builder().id(noteId).title("old").content("old").build();
+-        BookNoteEntity saved = BookNoteEntity.builder().id(noteId).title("new title").content("new content").build();
+-        BookNote dto = BookNote.builder().id(noteId).title("new title").content("new content").build();
+-
+-        when(bookRepository.findById(bookId)).thenReturn(Optional.of(BookEntity.builder().id(bookId).build()));
+-        when(userRepository.findById(userId)).thenReturn(Optional.of(BookLoreUserEntity.builder().id(userId).isDefaultPassword(false).build()));
+-        when(bookNoteRepository.findByIdAndUserId(noteId, userId)).thenReturn(Optional.of(existing));
+-        when(bookNoteRepository.save(existing)).thenReturn(saved);
+-        when(mapper.toDto(saved)).thenReturn(dto);
+-
+-        BookNote result = service.createOrUpdateNote(req);
+-
+-        assertEquals(noteId, result.getId());
+-        assertEquals("new title", existing.getTitle());
+-        assertEquals("new content", existing.getContent());
++    void createNote_writesNotesFileNextToBook() {
++        BookNote created = service.createOrUpdateNote(request(null, "Title", "Content"));
++
++        assertNotNull(created.getId());
++        assertEquals("Title", created.getTitle());
++        assertEquals(1L, created.getUserId());
++        assertTrue(Files.exists(libraryDir.resolve("My Book.notes.json")));
++        assertEquals(1, service.getNotesForBook(bookId).size());
+     }
+ 
+     @Test
+-    void createOrUpdateNote_throwsIfBookNotFound() {
+-        CreateBookNoteRequest req = CreateBookNoteRequest.builder()
+-                .bookId(bookId)
+-                .title("t")
+-                .content("c")
+-                .build();
++    void updateNote_changesContentInPlace() {
++        BookNote created = service.createOrUpdateNote(request(null, "Old", "Old content"));
+ 
+-        when(bookRepository.findById(bookId)).thenReturn(Optional.empty());
++        BookNote updated = service.createOrUpdateNote(request(created.getId(), "New", "New content"));
+ 
+-        RuntimeException ex = assertThrows(RuntimeException.class, () -> service.createOrUpdateNote(req));
++        assertEquals(created.getId(), updated.getId());
++        List<BookNote> notes = service.getNotesForBook(bookId);
++        assertEquals(1, notes.size());
++        assertEquals("New", notes.get(0).getTitle());
++        assertEquals("New content", notes.get(0).getContent());
++    }
+ 
+-        assertTrue(
+-                ex.getMessage().contains("BOOK_NOT_FOUND") || ex.getMessage().contains(String.valueOf(bookId)),
+-                "Exception message should contain 'BOOK_NOT_FOUND' or the book id"
+-        );
++    @Test
++    void updateNote_throwsWhenNoteDoesNotExist() {
++        assertThrows(EntityNotFoundException.class,
++                () -> service.createOrUpdateNote(request("does-not-exist", "T", "C")));
+     }
+ 
+     @Test
+-    void createOrUpdateNote_throwsIfUserNotFound() {
+-        CreateBookNoteRequest req = CreateBookNoteRequest.builder()
+-                .bookId(bookId)
+-                .title("t")
+-                .content("c")
+-                .build();
++    void notes_areIsolatedBetweenUsers() {
++        BookNote aliceNote = service.createOrUpdateNote(request(null, "Alice", "private"));
+ 
+-        when(bookRepository.findById(bookId)).thenReturn(Optional.of(BookEntity.builder().id(bookId).build()));
+-        when(userRepository.findById(userId)).thenReturn(Optional.empty());
++        loginAs(2L, "bob");
++        assertTrue(service.getNotesForBook(bookId).isEmpty());
++        assertThrows(EntityNotFoundException.class,
++                () -> service.createOrUpdateNote(request(aliceNote.getId(), "Hijack", "x")));
++        assertThrows(EntityNotFoundException.class, () -> service.deleteNote(bookId, aliceNote.getId()));
+ 
+-        assertThrows(EntityNotFoundException.class, () -> service.createOrUpdateNote(req));
+-    }
++        service.createOrUpdateNote(request(null, "Bob", "mine"));
++        assertEquals(1, service.getNotesForBook(bookId).size());
+ 
+-    @Test
+-    void createOrUpdateNote_throwsIfNoteNotFoundForUpdate() {
+-        CreateBookNoteRequest req = CreateBookNoteRequest.builder()
+-                .id(noteId)
+-                .bookId(bookId)
+-                .title("t")
+-                .content("c")
+-                .build();
+-
+-        when(bookRepository.findById(bookId)).thenReturn(Optional.of(BookEntity.builder().id(bookId).build()));
+-        when(userRepository.findById(userId)).thenReturn(Optional.of(BookLoreUserEntity.builder().id(userId).isDefaultPassword(false).build()));
+-        when(bookNoteRepository.findByIdAndUserId(noteId, userId)).thenReturn(Optional.empty());
+-
+-        assertThrows(EntityNotFoundException.class, () -> service.createOrUpdateNote(req));
++        loginAs(1L, "alice");
++        assertEquals(1, service.getNotesForBook(bookId).size());
++        assertEquals("Alice", service.getNotesForBook(bookId).get(0).getTitle());
+     }
+ 
+     @Test
+-    void deleteNote_deletesIfExists() {
+-        BookNoteEntity entity = BookNoteEntity.builder().id(noteId).build();
+-        when(bookNoteRepository.findByIdAndUserId(noteId, userId)).thenReturn(Optional.of(entity));
++    void deleteNote_removesNoteAndDeletesFileWhenEmpty() {
++        BookNote created = service.createOrUpdateNote(request(null, "T", "C"));
+ 
+-        service.deleteNote(noteId);
++        service.deleteNote(bookId, created.getId());
+ 
+-        verify(bookNoteRepository).delete(entity);
++        assertTrue(service.getNotesForBook(bookId).isEmpty());
++        assertFalse(Files.exists(libraryDir.resolve("My Book.notes.json")));
+     }
+ 
+     @Test
+-    void deleteNote_throwsIfNotFound() {
+-        when(bookNoteRepository.findByIdAndUserId(noteId, userId)).thenReturn(Optional.empty());
+-        assertThrows(EntityNotFoundException.class, () -> service.deleteNote(noteId));
++    void corruptNotesFile_isNeverOverwritten() throws Exception {
++        Path notesFile = libraryDir.resolve("My Book.notes.json");
++        Files.writeString(notesFile, "{ this is not json");
++
++        assertThrows(RuntimeException.class, () -> service.getNotesForBook(bookId));
++        assertThrows(RuntimeException.class, () -> service.createOrUpdateNote(request(null, "T", "C")));
++        assertEquals("{ this is not json", Files.readString(notesFile));
+     }
+ }
+diff --git a/booklore-ui/src/app/features/book/components/book-notes/book-notes-component.ts b/booklore-ui/src/app/features/book/components/book-notes/book-notes-component.ts
+index 1f65264..614f777 100644
+--- a/booklore-ui/src/app/features/book/components/book-notes/book-notes-component.ts
++++ b/booklore-ui/src/app/features/book/components/book-notes/book-notes-component.ts
+@@ -203,8 +203,8 @@ export class BookNotesComponent implements OnInit, OnChanges {
+     });
+   }
+ 
+-  private performDelete(noteId: number): void {
+-    this.bookNoteService.deleteNote(noteId).subscribe({
++  private performDelete(noteId: string): void {
++    this.bookNoteService.deleteNote(this.bookId, noteId).subscribe({
+       next: () => {
+         this.notes = this.notes.filter(n => n.id !== noteId);
+         this.messageService.add({
+diff --git a/booklore-ui/src/app/shared/service/book-note.service.ts b/booklore-ui/src/app/shared/service/book-note.service.ts
+index 1e923eb..7168937 100644
+--- a/booklore-ui/src/app/shared/service/book-note.service.ts
++++ b/booklore-ui/src/app/shared/service/book-note.service.ts
+@@ -4,7 +4,7 @@ import {Observable} from 'rxjs';
+ import {API_CONFIG} from '../../core/config/api-config';
+ 
+ export interface BookNote {
+-  id: number;
++  id: string;
+   userId: number;
+   bookId: number;
+   title: string;
+@@ -14,7 +14,7 @@ export interface BookNote {
+ }
+ 
+ export interface CreateBookNoteRequest {
+-  id?: number;
++  id?: string;
+   bookId: number;
+   title: string;
+   content: string;
+@@ -36,7 +36,7 @@ export class BookNoteService {
+     return this.http.post<BookNote>(this.url, request);
+   }
+ 
+-  deleteNote(noteId: number): Observable<void> {
+-    return this.http.delete<void>(`${this.url}/${noteId}`);
++  deleteNote(bookId: number, noteId: string): Observable<void> {
++    return this.http.delete<void>(`${this.url}/book/${bookId}/${noteId}`);
+   }
+ }
